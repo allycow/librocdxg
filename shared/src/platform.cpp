@@ -44,6 +44,8 @@
 #include "shared/include/thunks.h"
 #include "shared/include/platform.h"
 #include "shared/include/device.h"
+#include "shared/include/gpu_info.h"
+#include "shared/include/utils.h"
 #include "shared/include/thunk_proxy/thunk_proxy.h"
 #include <memory>
 #include <vector>
@@ -53,9 +55,10 @@ namespace thunk {
 
 using namespace std;
 
+__attribute__((visibility("hidden")))
 Platform& Platform::instance() {
-  static Platform platform_;
-  return platform_;
+  static Platform *platform_ = new Platform();
+  return *platform_;
 }
 
 ErrorCode Platform::Init() {
@@ -65,8 +68,10 @@ ErrorCode Platform::Init() {
 void Platform::Destroy() {
   TearDownDevices();
 
-  for (auto i = 0u; i < lda_chain_count_; i++)
+  for (auto i = 0u; i < lda_chain_count_; i++) {
     delete lda_chain_list_[i];
+    lda_chain_list_[i] = nullptr;
+  }
 
   lda_chain_count_ = 0;
 }
@@ -78,10 +83,10 @@ void Platform::TearDownDevices() {
 }
 
 ErrorCode Platform::ReEnumerateDevices() {
-  TearDownDevices();
+  Destroy();
   auto code = reQueryDevices();
   if (code != ErrorCode::Success)
-    TearDownDevices();
+    Destroy();
   return code;
 }
 
@@ -140,16 +145,28 @@ ErrorCode Platform::queryLinkedDevicesInLdaChain(
 
     code = d3dthunk::QueryAdapterInfo(&queryInfo);
 
-    if ((code == ErrorCode::Success) &&
-        (curPhysDev.DeviceIds.VendorID != AMD_VENDOR_ID) &&
-        (curPhysDev.DeviceIds.VendorID != ATI_VENDOR_ID) &&
-        (curPhysDev.DeviceIds.VendorID != intelVendorId)) {
+    if (code != ErrorCode::Success)
+      break;
+
+    const u32 vendorId = curPhysDev.DeviceIds.VendorID;
+    if (vendorId != AMD_VENDOR_ID && vendorId != ATI_VENDOR_ID &&
+        vendorId != intelVendorId) {
       code = ErrorCode::IncompatibleDevice;
+      break;
+    }
+
+    if ((vendorId == AMD_VENDOR_ID || vendorId == ATI_VENDOR_ID) &&
+        !QueryAdapterSupported(curPhysDev.DeviceIds.DeviceID)) {
+      code = ErrorCode::IncompatibleDevice;
+      break;
     }
   }
 
   if (code != ErrorCode::Success)
     return code;
+
+  if (lda_chain_count_ >= MaxDevices)
+    return ErrorCode::InitializationFailed;
 
   auto ctx = std::unique_ptr<thunk_proxy::ChainContext>(
       thunk_proxy::ChainContext::Create(
